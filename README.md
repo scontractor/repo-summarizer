@@ -1,66 +1,64 @@
-# GitHub Repository Summarizer
+# 🔍 GitHub Repository Summarizer
 
-A lightweight API service that takes a public GitHub repository URL and returns a structured, LLM-generated summary of the project — what it does, which technologies it uses, and how it is organized.
+Paste in any public GitHub URL and get back a clean, structured summary — what the project does, what technologies it uses, and how it's organized. Powered by an LLM via the Nebius Token Factory API.
 
 ---
 
-## Quick start
+## Setup
 
 ### 1. Prerequisites
 
 - Python 3.10 or later
-- A Nebius Token Factory API key (or OpenAI / Anthropic key)
+- A **Nebius Token Factory** API key — [sign up here](https://tokenfactory.nebius.com/) (you get $1 free credit, no top-up needed for this project)
+- Alternatively, an OpenAI or Gemini API key works too
 
-### 2. Clone / download the project
-
-```bash
-# If you have git
-git clone <your-repo-url>
-cd repo-summarizer
-
-# Or unzip the archive
-unzip repo-summarizer.zip
-cd repo-summarizer
-```
-
-### 3. Create and activate a virtual environment
+### 2. Install dependencies
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate        # macOS / Linux
-# .venv\Scripts\activate         # Windows PowerShell
-```
 
-### 4. Install dependencies
+# macOS / Linux
+source .venv/bin/activate
 
-```bash
+# Windows
+.venv\Scripts\activate
+
 pip install -r requirements.txt
 ```
 
-### 5. Set your API key
+### 3. Create a `.env` file
 
-```bash
-# Nebius Token Factory (preferred)
-export NEBIUS_API_KEY="your_nebius_api_key_here"
+Create a file called `.env` in the project root and add your API key:
 
-# — or — OpenAI
-export OPENAI_API_KEY="your_openai_api_key_here"
-
-# Optional: raise GitHub API rate limit from 60 to 5 000 requests/hour
-export GITHUB_TOKEN="your_github_personal_access_token"
+```
+NEBIUS_API_KEY=your_key_here
 ```
 
-### 6. Start the server
+Other supported keys (only one is needed):
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+```
+OPENAI_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
 ```
 
-The server is now running at `http://localhost:8000`.
+> **Optional:** Add a `GITHUB_TOKEN` to raise the GitHub API rate limit from 60 to 5,000 requests/hour. Useful if you're testing many repos quickly.
+> ```
+> GITHUB_TOKEN=your_github_token_here
+> ```
+
+### 4. Start the server
+
+```bash
+uvicorn main:app --port 8000 --env-file .env --reload
+```
+
+The server is running at `http://localhost:8000`. The `--reload` flag automatically restarts it when you edit `main.py`.
 
 ---
 
 ## Usage
+
+Send a POST request with any public GitHub URL:
 
 ```bash
 curl -X POST http://localhost:8000/summarize \
@@ -68,13 +66,22 @@ curl -X POST http://localhost:8000/summarize \
   -d '{"github_url": "https://github.com/psf/requests"}'
 ```
 
+**On Windows (PowerShell):**
+
+```powershell
+(Invoke-WebRequest -Uri "http://localhost:8000/summarize" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"github_url": "https://github.com/psf/requests"}').Content | ConvertFrom-Json | ConvertTo-Json
+```
+
 **Example response:**
 
 ```json
 {
-  "summary": "**Requests** is a widely-used Python HTTP library designed to make HTTP/1.1 requests simple and human-friendly...",
+  "summary": "Requests is a widely-used Python HTTP library designed to make HTTP/1.1 requests simple and human-friendly. It abstracts away the complexity of making requests behind a simple API, supporting connection keep-alive, session cookies, SSL verification, and more.",
   "technologies": ["Python", "urllib3", "certifi", "charset-normalizer", "idna"],
-  "structure": "The main library code lives in `src/requests/`. Tests are in `tests/`, documentation source in `docs/`. Package metadata is in `pyproject.toml` and `setup.cfg`."
+  "structure": "The main library code lives in src/requests/. Tests are in tests/, documentation in docs/. Package metadata is defined in pyproject.toml and setup.cfg."
 }
 ```
 
@@ -86,47 +93,68 @@ curl http://localhost:8000/health
 
 ---
 
+## Watching progress
+
+When a request is running, switch to the **uvicorn terminal tab** to see live progress:
+
+```
+🚀 Summarising psf/requests
+⏳ [1/3] Fetching repo metadata...
+✅ Found: psf/requests (52847 stars, language: Python)
+⏳ [2/3] Fetching file tree...
+✅ Tree: 143 total files → 38 selected for analysis (rest skipped as noise)
+⏳ [3/3] Fetching file contents (budget: 28000 chars)...
+   📄 README.md (3821 chars, budget remaining: 24179)
+   📄 pyproject.toml (1204 chars, budget remaining: 22975)
+⏳ Sending 18432 chars to meta-llama/Llama-3.3-70B-Instruct...
+✅ LLM responded — parsing JSON...
+🎉 Done — 5 technologies detected
+```
+
+---
+
 ## Model choice
 
-**Model:** `meta-llama/Meta-Llama-3.1-70B-Instruct` via Nebius Token Factory.
+**Model:** `meta-llama/Llama-3.3-70B-Instruct` via Nebius Token Factory.
 
-This model was chosen because it has a 128 k context window (important for larger repos), produces reliably structured JSON output at `temperature=0.2`, and is available on Nebius with a generous free credit allowance. If an OpenAI key is provided instead, the service falls back to `gpt-4o-mini`.
-
----
-
-## Repository content strategy
-
-### What we include
-
-| Priority | Files |
-|----------|-------|
-| Highest | README, `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod` — these immediately reveal purpose and dependencies |
-| High | Entry-point files (`main.py`, `app.py`, `index.js`), Dockerfiles, CI configs |
-| Normal | Source files, ordered shortest path first (top-level files are usually more representative) |
-
-### What we skip
-
-- **Binary and media files** (`.png`, `.jpg`, `.pdf`, `.whl`, `.exe`, …) — no textual signal
-- **Lock files** (`package-lock.json`, `poetry.lock`, `yarn.lock`, …) — machine-generated, enormous, zero human signal
-- **Generated / vendored directories** (`node_modules/`, `dist/`, `build/`, `venv/`, `__pycache__/`, …)
-- **Data files** (`.csv`, `.parquet`, `.db`) — not relevant to understanding structure
-
-### Context management
-
-1. The full **directory tree** (up to 80 entries) is always included — it is small and gives the LLM a structural overview.
-2. Files are fetched in priority order. Each file is **capped at 4 000 characters** (enough to understand purpose, not so much that one file dominates).
-3. A **total character budget of 28 000 chars** (~7 000 tokens) is enforced across all file contents. Once the budget is spent, lower-priority files are skipped.
-4. This means the LLM always receives the *most informative* subset of the repo, regardless of repo size.
+Chosen for its 128k context window (handles large repos well), reliable structured JSON output, and availability on Nebius with free credits. The service automatically falls back to `gpt-4o-mini` if an OpenAI key is provided instead, or `gemini-2.5-flash` for a Gemini key.
 
 ---
 
-## Error handling
+## How repository content is selected
+
+Sending an entire repo to an LLM isn't practical — repos can have thousands of files. Instead, the service is selective:
+
+**What gets included (in priority order):**
+
+| Priority | Examples |
+|----------|---------|
+| Highest | `README`, `pyproject.toml`, `package.json`, `go.mod` — immediately reveal purpose and dependencies |
+| High | Entry points (`main.py`, `app.py`, `index.js`), Dockerfiles, CI configs |
+| Normal | Other source files, preferring shorter paths (top-level files are most representative) |
+
+**What gets skipped:**
+
+- **Binary and media files** (`.png`, `.pdf`, `.exe`, …) — no text content
+- **Lock files** (`package-lock.json`, `poetry.lock`, …) — machine-generated, enormous, zero signal
+- **Generated directories** (`node_modules/`, `dist/`, `venv/`, `__pycache__/`, …)
+- **Data files** (`.csv`, `.db`, `.parquet`) — irrelevant to code structure
+
+**Context limits:**
+
+- Each file is capped at **4,000 characters** so no single file dominates the context
+- A total budget of **28,000 characters** (~7,000 tokens) is enforced across all files
+- The directory tree (up to 80 entries) is always included — it's small but gives the LLM the full structural picture
+
+---
+
+## Error reference
 
 | Scenario | HTTP status |
 |----------|-------------|
 | Invalid or non-GitHub URL | 422 |
-| Repository not found / private | 404 |
-| GitHub rate limit exceeded | 403 (with tip to set `GITHUB_TOKEN`) |
+| Repository not found or private | 404 |
+| GitHub rate limit exceeded | 403 |
 | Empty repository | 422 |
 | GitHub API timeout | 504 |
 | LLM returns malformed response | 502 |
