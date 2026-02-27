@@ -1,64 +1,53 @@
 """
 GitHub Repository Summarizer API
-Fetches a public GitHub repo, selects the most informative files,
-and returns an LLM-generated summary.
+
+POST /summarize  — accepts a GitHub URL, fetches the repo contents intelligently,
+                   and returns an LLM-generated summary of the project.
+GET  /health     — simple liveness check.
 """
 
 import os
 import re
+import json
 import base64
 import logging
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 from openai import OpenAI
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# -- Logging ------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+# -- App ----------------------------------------------------------------------
 app = FastAPI(title="GitHub Repo Summarizer", version="1.0.0")
 
-# ---------------------------------------------------------------------------
-# Config — read from environment
-# ---------------------------------------------------------------------------
+# -- API keys (injected via .env file) ----------------------------------------
 NEBIUS_API_KEY = os.getenv("NEBIUS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional, raises rate limit from 60 to 5000 req/hr
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN")  # optional: raises GitHub rate limit 60 → 5000 req/hr
 
-# Decide which provider to use
+
 def _get_llm_client() -> tuple[OpenAI, str]:
-    """Return (client, model_name) for whichever API key is configured."""
+    """Return (client, model) for whichever API key is present."""
     if NEBIUS_API_KEY:
-        client = OpenAI(
-            base_url="https://api.studio.nebius.com/v1/",
+        return OpenAI(
+            base_url="https://api.tokenfactory.nebius.com/v1/",
             api_key=NEBIUS_API_KEY,
-        )
-        # Nebius Token Factory — capable open model with large context
-        model = "meta-llama/Meta-Llama-3.1-70B-Instruct"
-        return client, model
+        ), "meta-llama/Llama-3.3-70B-Instruct"
     if OPENAI_API_KEY:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        return client, "gpt-4o-mini"
-    # Anthropic uses its own SDK but also has an OpenAI-compatible endpoint
-    raise RuntimeError(
-        "No LLM API key found. Set NEBIUS_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY."
-    )
+        return OpenAI(api_key=OPENAI_API_KEY), "gpt-4o-mini"
+    if GEMINI_API_KEY:
+        return OpenAI(api_key=GEMINI_API_KEY), "gemini-2.5-flash"
+    raise RuntimeError("No LLM API key found. Set NEBIUS_API_KEY or OPENAI_API_KEY or GEMINI_API_KEY.")
 
 
-# ---------------------------------------------------------------------------
-# File-selection constants
-# ---------------------------------------------------------------------------
+# -- File selection -----------------------------------------------------------
 
-# Files we always try to include (in priority order)
+# These files give the LLM the best signal — fetched first, in priority order.
 PRIORITY_FILES = [
     "readme.md", "readme.rst", "readme.txt", "readme",
     "pyproject.toml", "setup.py", "setup.cfg",
@@ -67,50 +56,42 @@ PRIORITY_FILES = [
     "dockerfile", "docker-compose.yml", "docker-compose.yaml",
     "makefile", ".github/workflows",
     "main.py", "app.py", "index.js", "index.ts", "main.go", "main.rs",
-    "src/main.py", "src/app.py",
 ]
 
-# Extensions we skip entirely (binary / generated / irrelevant)
+# Binary, generated, or irrelevant file extensions — skipped entirely.
 SKIP_EXTENSIONS = {
-    # binaries & media
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
-    ".mp3", ".mp4", ".wav", ".avi", ".mov",
-    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar",
-    ".exe", ".dll", ".so", ".dylib", ".whl", ".egg",
-    ".pyc", ".pyo", ".class", ".o", ".a",
-    # data / generated
-    ".csv", ".tsv", ".parquet", ".db", ".sqlite",
-    ".min.js", ".min.css",
-    # fonts
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",   # images
+    ".mp3", ".mp4", ".wav", ".avi", ".mov",                      # media
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar",       # archives
+    ".exe", ".dll", ".so", ".dylib", ".whl", ".egg",             # binaries
+    ".pyc", ".pyo", ".class", ".o", ".a",                        # compiled
+    ".csv", ".tsv", ".parquet", ".db", ".sqlite",                # data files
+    ".min.js", ".min.css",                                       # minified
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",                   # fonts
 }
 
-# Path segments that indicate generated / vendored / irrelevant content
-SKIP_PATH_SEGMENTS = {
+# Directory names that signal vendored, generated, or irrelevant content.
+SKIP_DIRS = {
     "node_modules", ".git", "__pycache__", ".pytest_cache",
     "dist", "build", ".next", ".nuxt", "coverage",
-    "vendor", "third_party", "venv", ".venv", "env",
-    ".tox", "eggs", "*.egg-info",
-    "migrations",  # usually auto-generated DB migrations
+    "vendor", "third_party", "venv", ".venv", "env", ".tox",
 }
 
-# Lock files — skip them (very large, no useful signal)
-SKIP_EXACT_NAMES = {
+# Lock files are enormous and carry zero human-readable signal.
+SKIP_FILENAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "poetry.lock", "pipfile.lock", "cargo.lock",
-    "composer.lock", "gemfile.lock",
-    ".ds_store", "thumbs.db",
+    "composer.lock", "gemfile.lock", ".ds_store",
 }
 
-# Hard limit on characters we read from a single file
+# Per-file character cap — enough to understand purpose without one file dominating.
 MAX_FILE_CHARS = 4_000
-# Approximate token budget for all file contents combined (1 token ≈ 4 chars)
-CONTEXT_BUDGET_CHARS = 28_000  # ~7 000 tokens for content
+# Total character budget across all fetched files (~7 000 tokens).
+CONTEXT_BUDGET_CHARS = 28_000
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+# -- Pydantic models ----------------------------------------------------------
+
 class SummarizeRequest(BaseModel):
     github_url: str
 
@@ -129,14 +110,7 @@ class SummarizeResponse(BaseModel):
     structure: str
 
 
-class ErrorResponse(BaseModel):
-    status: str = "error"
-    message: str
-
-
-# ---------------------------------------------------------------------------
-# GitHub helpers
-# ---------------------------------------------------------------------------
+# -- GitHub helpers -----------------------------------------------------------
 
 def _github_headers() -> dict:
     h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -146,7 +120,7 @@ def _github_headers() -> dict:
 
 
 def _parse_github_url(url: str) -> tuple[str, str]:
-    """Extract (owner, repo) from a GitHub URL."""
+    """Return (owner, repo) from a GitHub URL."""
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)", url)
     if not m:
         raise ValueError(f"Cannot parse GitHub URL: {url}")
@@ -154,25 +128,18 @@ def _parse_github_url(url: str) -> tuple[str, str]:
 
 
 def _should_skip(path: str) -> bool:
-    """Return True if we should skip this file."""
+    """Return True if this file should be excluded from LLM context."""
     lower = path.lower()
-    # Check exact file name
     filename = lower.split("/")[-1]
-    if filename in SKIP_EXACT_NAMES:
-        return True
-    # Check extension
-    for ext in SKIP_EXTENSIONS:
-        if lower.endswith(ext):
-            return True
-    # Check path segments
-    parts = set(lower.split("/"))
-    if parts & SKIP_PATH_SEGMENTS:
-        return True
-    return False
+    return (
+        filename in SKIP_FILENAMES
+        or any(lower.endswith(ext) for ext in SKIP_EXTENSIONS)
+        or bool(set(lower.split("/")) & SKIP_DIRS)
+    )
 
 
 def _priority_score(path: str) -> int:
-    """Lower = higher priority."""
+    """Lower score = higher priority. Unprioritised files get the maximum score."""
     lower = path.lower()
     for i, pattern in enumerate(PRIORITY_FILES):
         if lower == pattern or lower.endswith("/" + pattern) or lower.startswith(pattern):
@@ -180,152 +147,139 @@ def _priority_score(path: str) -> int:
     return len(PRIORITY_FILES)
 
 
-def _fetch_repo_contents(owner: str, repo: str, client: httpx.Client) -> dict:
+def _fetch_repo_contents(owner: str, repo: str, http: httpx.Client) -> dict:
     """
-    Fetch repo metadata and a filtered, prioritised list of file contents.
-    Returns a dict with keys: meta, tree, files.
+    Fetch repo metadata and selected file contents from the GitHub API.
+    Returns: { meta: dict, tree: str, files: dict[path, content] }
     """
     headers = _github_headers()
 
-    # 1. Repo metadata
-    resp = client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
+    # 1. Repo metadata (description, language, stars, default branch)
+    log.info("⏳ [1/3] Fetching repo metadata...")
+    resp = http.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Repository not found or is private")
+        raise HTTPException(404, "Repository not found or is private")
     if resp.status_code == 403:
-        raise HTTPException(status_code=403, detail="GitHub rate limit exceeded. Set GITHUB_TOKEN env var.")
+        raise HTTPException(403, "GitHub rate limit exceeded — set the GITHUB_TOKEN env var to increase it")
     resp.raise_for_status()
     meta = resp.json()
+    log.info("✅ Found: %s (%s stars, language: %s)",
+             meta.get("full_name"), meta.get("stargazers_count"), meta.get("language") or "N/A")
 
-    # 2. Default branch tree (recursive)
-    default_branch = meta.get("default_branch", "main")
-    tree_resp = client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1",
+    # 2. Full recursive file tree for the default branch
+    log.info("⏳ [2/3] Fetching file tree...")
+    branch = meta.get("default_branch", "main")
+    tree_resp = http.get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1",
         headers=headers,
     )
     if tree_resp.status_code == 409:
-        # Empty repo
-        return {"meta": meta, "tree": [], "files": {}}
+        return {"meta": meta, "tree": "", "files": {}}  # empty repo
     tree_resp.raise_for_status()
-    tree_data = tree_resp.json()
+    all_items = tree_resp.json().get("tree", [])
 
-    # 3. Filter blobs (files only, skip dirs and skip-listed paths)
-    all_files = [
-        item for item in tree_data.get("tree", [])
-        if item["type"] == "blob" and not _should_skip(item["path"])
-    ]
+    # Separate blobs (files) from trees (dirs), filter out noise
+    all_blob_paths = [i["path"] for i in all_items if i["type"] == "blob"]
+    candidate_files = [i for i in all_items if i["type"] == "blob" and not _should_skip(i["path"])]
+    candidate_files.sort(key=lambda f: (_priority_score(f["path"]), len(f["path"])))
+    log.info("✅ Tree: %d total files → %d selected for analysis (rest skipped as noise)",
+             len(all_blob_paths), len(candidate_files))
 
-    # Sort by priority score, then by path length (prefer shorter = top-level)
-    all_files.sort(key=lambda f: (_priority_score(f["path"]), len(f["path"])))
+    tree_str = _build_tree_string(all_blob_paths)
 
-    # 4. Build directory tree string (always include, very cheap)
-    all_paths = [item["path"] for item in tree_data.get("tree", []) if item["type"] == "blob"]
-    tree_str = _build_tree_string(all_paths)
-
-    # 5. Fetch file contents within budget
-    budget_remaining = CONTEXT_BUDGET_CHARS
+    # 3. Fetch file contents until the character budget is spent
+    log.info("⏳ [3/3] Fetching file contents (budget: %d chars)...", CONTEXT_BUDGET_CHARS)
     fetched_files = {}
-
-    for file_item in all_files:
-        if budget_remaining <= 0:
+    budget = CONTEXT_BUDGET_CHARS
+    for item in candidate_files:
+        if budget <= 0:
+            log.info("   💰 Budget exhausted — stopping early")
             break
-        path = file_item["path"]
+        path = item["path"]
         try:
-            content_resp = client.get(
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
-                headers=headers,
-            )
-            if content_resp.status_code != 200:
+            r = http.get(f"https://api.github.com/repos/{owner}/{repo}/contents/{path}", headers=headers)
+            if r.status_code != 200:
                 continue
-            data = content_resp.json()
-            if data.get("encoding") == "base64":
-                raw = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-            else:
-                raw = data.get("content", "")
+            data = r.json()
+            raw = base64.b64decode(data["content"]).decode("utf-8", errors="replace") \
+                  if data.get("encoding") == "base64" else data.get("content", "")
 
-            # Truncate long files
+            # Truncate oversized files with a note so the LLM knows it's partial
             if len(raw) > MAX_FILE_CHARS:
-                raw = raw[:MAX_FILE_CHARS] + f"\n... [truncated — file is {len(raw)} chars total]"
+                raw = raw[:MAX_FILE_CHARS] + f"\n... [truncated — {len(raw)} chars total]"
 
             fetched_files[path] = raw
-            budget_remaining -= len(raw)
+            budget -= len(raw)
+            log.info("   📄 %s (%d chars, budget remaining: %d)", path, len(raw), budget)
         except Exception as e:
-            log.warning("Could not fetch %s: %s", path, e)
+            log.warning("   ⚠️  Skipping %s: %s", path, e)
+
+    log.info("✅ Fetched %d files, total context: %d chars",
+             len(fetched_files), CONTEXT_BUDGET_CHARS - budget)
 
     return {"meta": meta, "tree": tree_str, "files": fetched_files}
 
 
 def _build_tree_string(paths: list[str], max_lines: int = 80) -> str:
-    """Build a compact directory tree from a list of file paths."""
+    """Compact sorted file listing, capped at max_lines."""
     lines = sorted(paths)[:max_lines]
     if len(paths) > max_lines:
         lines.append(f"... and {len(paths) - max_lines} more files")
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# LLM summarization
-# ---------------------------------------------------------------------------
+# -- LLM summarization --------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are a senior software engineer. Your task is to analyze a GitHub repository
-and produce a structured summary for a developer audience.
+You are a senior software engineer analysing a GitHub repository.
 
-Respond ONLY with a valid JSON object (no markdown fences, no extra text) with this shape:
+Respond ONLY with a valid JSON object — no markdown fences, no extra text:
 {
-  "summary": "<one or two paragraphs describing what the project does and its purpose>",
-  "technologies": ["<tech1>", "<tech2>", "..."],
-  "structure": "<one paragraph describing how the project is organized>"
+  "summary": "<one or two paragraphs: what the project does, who it's for, notable features>",
+  "technologies": ["<specific tech, e.g. FastAPI not just Python web>", "..."],
+  "structure": "<one paragraph: directory layout and role of key files/folders>"
 }
 
-Guidelines:
-- summary: explain what the project does, who it's for, and any notable features or design goals.
-- technologies: list programming languages, frameworks, libraries, and key tools. Be specific (e.g. "FastAPI" not just "Python web").
-- structure: describe the directory layout and the role of key files/directories.
-- Be concise and accurate. Do not hallucinate features not evidenced by the provided files.
+Be concise and accurate. Do not invent features not evidenced by the provided files.
 """
 
 
 def _build_user_message(meta: dict, tree: str, files: dict) -> str:
+    """Assemble the prompt context sent to the LLM."""
     parts = [
         f"# Repository: {meta.get('full_name', 'unknown')}",
-        f"Description (from GitHub): {meta.get('description') or 'N/A'}",
+        f"GitHub description: {meta.get('description') or 'N/A'}",
         f"Primary language: {meta.get('language') or 'N/A'}",
         f"Stars: {meta.get('stargazers_count', 0)}",
         "",
-        "## Directory tree (first 80 entries)",
-        "```",
-        tree,
-        "```",
+        f"## File tree (first 80 entries)\n```\n{tree}\n```",
         "",
         "## Selected file contents",
     ]
-
     for path, content in files.items():
         parts.append(f"\n### {path}\n```\n{content}\n```")
-
     return "\n".join(parts)
 
 
 def _call_llm(user_message: str) -> SummarizeResponse:
-    """Call the configured LLM and parse the structured response."""
-    import json
-
+    """Send context to the LLM and parse the structured JSON response."""
     client, model = _get_llm_client()
-    log.info("Calling LLM model: %s", model)
+    log.info("⏳ Sending %d chars to %s...", len(user_message), model)
 
     completion = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
+            {"role": "user",   "content": user_message},
         ],
-        temperature=0.2,
+        temperature=0.2,  # low temperature = consistent, structured output
         max_tokens=1024,
     )
 
+    log.info("✅ LLM responded — parsing JSON...")
     raw = completion.choices[0].message.content.strip()
 
-    # Strip markdown code fences if the model wraps them anyway
+    # Strip markdown fences in case the model adds them despite instructions
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw)
@@ -333,35 +287,31 @@ def _call_llm(user_message: str) -> SummarizeResponse:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        log.error("LLM returned non-JSON: %s", raw[:500])
-        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {e}")
+        log.error("LLM returned non-JSON: %s", raw[:300])
+        raise HTTPException(502, f"LLM returned invalid JSON: {e}")
 
-    # Validate required fields
     for field in ("summary", "technologies", "structure"):
         if field not in data:
-            raise HTTPException(status_code=502, detail=f"LLM response missing field: {field}")
+            raise HTTPException(502, f"LLM response missing field: '{field}'")
 
+    # Normalise technologies to a list in case the model returns a string
     if not isinstance(data["technologies"], list):
         data["technologies"] = [data["technologies"]]
 
     return SummarizeResponse(**data)
 
 
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
+# -- Endpoints ----------------------------------------------------------------
 
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize(request: SummarizeRequest):
-    """
-    Accepts a GitHub repository URL and returns an LLM-generated summary.
-    """
+    """Fetch a GitHub repo and return an LLM-generated summary."""
     try:
         owner, repo = _parse_github_url(request.github_url)
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(422, str(e))
 
-    log.info("Summarizing %s/%s", owner, repo)
+    log.info("🚀 Summarising %s/%s", owner, repo)
 
     try:
         with httpx.Client(timeout=30) as http:
@@ -369,34 +319,28 @@ def summarize(request: SummarizeRequest):
     except HTTPException:
         raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="GitHub API timed out")
+        raise HTTPException(504, "GitHub API timed out")
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"GitHub API error: {e.response.status_code}")
+        raise HTTPException(502, f"GitHub API error: {e.response.status_code}")
     except Exception as e:
         log.exception("Unexpected error fetching repo")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch repository: {e}")
+        raise HTTPException(500, f"Failed to fetch repository: {e}")
 
     if not repo_data["files"] and not repo_data["tree"]:
-        raise HTTPException(status_code=422, detail="Repository appears to be empty")
-
-    user_message = _build_user_message(
-        repo_data["meta"], repo_data["tree"], repo_data["files"]
-    )
+        raise HTTPException(422, "Repository appears to be empty")
 
     try:
-        return _call_llm(user_message)
+        result = _call_llm(_build_user_message(repo_data["meta"], repo_data["tree"], repo_data["files"]))
+        log.info("🎉 Done — %d technologies detected", len(result.technologies))
+        return result
     except HTTPException:
         raise
     except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
     except Exception as e:
         log.exception("Unexpected error calling LLM")
-        raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
+        raise HTTPException(500, f"LLM call failed: {e}")
 
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
