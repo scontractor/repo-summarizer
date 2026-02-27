@@ -13,7 +13,9 @@ import base64
 import logging
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, field_validator
 from openai import OpenAI
 
@@ -24,11 +26,31 @@ log = logging.getLogger(__name__)
 # -- App ----------------------------------------------------------------------
 app = FastAPI(title="GitHub Repo Summarizer", version="1.0.0")
 
+# -- Error handlers -----------------------------------------------------------
+# Return {"status": "error", "message": "..."} for all errors, as per spec.
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Extract the first error message and return it cleanly
+    message = exc.errors()[0].get("msg", str(exc))
+    return JSONResponse(
+        status_code=422,
+        content={"status": "error", "message": message},
+    )
+
 # -- API keys (injected via .env file) ----------------------------------------
 NEBIUS_API_KEY = os.getenv("NEBIUS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN")  # optional: raises GitHub rate limit 60 → 5000 req/hr
+log.info("GitHub token loaded: %s", "YES" if GITHUB_TOKEN else "NO")
 
 
 def _get_llm_client() -> tuple[OpenAI, str]:
@@ -160,7 +182,8 @@ def _fetch_repo_contents(owner: str, repo: str, http: httpx.Client) -> dict:
     if resp.status_code == 404:
         raise HTTPException(404, "Repository not found or is private")
     if resp.status_code == 403:
-        raise HTTPException(403, "GitHub rate limit exceeded — set the GITHUB_TOKEN env var to increase it")
+        log.error("GitHub 403: %s", resp.text)
+        raise HTTPException(403, f"GitHub returned 403: {resp.json().get('message', resp.text)}")
     resp.raise_for_status()
     meta = resp.json()
     log.info("✅ Found: %s (%s stars, language: %s)",
@@ -178,26 +201,47 @@ def _fetch_repo_contents(owner: str, repo: str, http: httpx.Client) -> dict:
     tree_resp.raise_for_status()
     all_items = tree_resp.json().get("tree", [])
 
-    # Separate blobs (files) from trees (dirs), filter out noise
+    # Filter: blobs only, skip noise
     all_blob_paths = [i["path"] for i in all_items if i["type"] == "blob"]
     candidate_files = [i for i in all_items if i["type"] == "blob" and not _should_skip(i["path"])]
+
+    # Sort by priority, then path length (shorter = more top-level)
     candidate_files.sort(key=lambda f: (_priority_score(f["path"]), len(f["path"])))
-    log.info("✅ Tree: %d total files → %d selected for analysis (rest skipped as noise)",
-             len(all_blob_paths), len(candidate_files))
+
+    # Pre-filter using file sizes from the tree API — only keep files that will
+    # plausibly fit in the budget. This avoids fetching files we'll never use,
+    # which is the main cause of burning through GitHub API quota.
+    # The tree API returns size in bytes ≈ chars for text files.
+    files_to_fetch = []
+    estimated_budget = CONTEXT_BUDGET_CHARS
+    for f in candidate_files:
+        if estimated_budget <= 0:
+            break
+        files_to_fetch.append(f)
+        estimated_budget -= min(f.get("size", MAX_FILE_CHARS), MAX_FILE_CHARS)
+
+    log.info("✅ Tree: %d total → %d after noise filter → %d to fetch (pre-filtered by size)",
+             len(all_blob_paths), len(candidate_files), len(files_to_fetch))
 
     tree_str = _build_tree_string(all_blob_paths)
 
-    # 3. Fetch file contents until the character budget is spent
-    log.info("⏳ [3/3] Fetching file contents (budget: %d chars)...", CONTEXT_BUDGET_CHARS)
+    # 3. Fetch files sequentially in priority order, stop when budget is spent.
+    # Sequential is intentional — it uses far fewer API calls than parallel
+    # fetching, which previously burned through 5000 req/hr in a few requests.
+    log.info("⏳ [3/3] Fetching %d files sequentially...", len(files_to_fetch))
     fetched_files = {}
     budget = CONTEXT_BUDGET_CHARS
-    for item in candidate_files:
+
+    for item in files_to_fetch:
         if budget <= 0:
-            log.info("   💰 Budget exhausted — stopping early")
+            log.info("   💰 Budget exhausted — stopping")
             break
         path = item["path"]
         try:
-            r = http.get(f"https://api.github.com/repos/{owner}/{repo}/contents/{path}", headers=headers)
+            r = http.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                headers=headers,
+            )
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -214,8 +258,8 @@ def _fetch_repo_contents(owner: str, repo: str, http: httpx.Client) -> dict:
         except Exception as e:
             log.warning("   ⚠️  Skipping %s: %s", path, e)
 
-    log.info("✅ Fetched %d files, total context: %d chars",
-             len(fetched_files), CONTEXT_BUDGET_CHARS - budget)
+    log.info("✅ Fetched %d files using %d API calls, context: %d chars",
+             len(fetched_files), len(fetched_files) + 2, CONTEXT_BUDGET_CHARS - budget)
 
     return {"meta": meta, "tree": tree_str, "files": fetched_files}
 
@@ -233,14 +277,59 @@ def _build_tree_string(paths: list[str], max_lines: int = 80) -> str:
 SYSTEM_PROMPT = """\
 You are a senior software engineer analysing a GitHub repository.
 
-Respond ONLY with a valid JSON object — no markdown fences, no extra text:
+Respond ONLY with a valid JSON object — no markdown fences, no extra text.
+
+Required shape:
 {
   "summary": "<one or two paragraphs: what the project does, who it's for, notable features>",
-  "technologies": ["<specific tech, e.g. FastAPI not just Python web>", "..."],
+  "technologies": ["<specific tech>", "..."],
   "structure": "<one paragraph: directory layout and role of key files/folders>"
 }
 
-Be concise and accurate. Do not invent features not evidenced by the provided files.
+Rules:
+- Be specific: "FastAPI" not "Python web framework", "pytest" not "testing tool"
+- Do not invent features not evidenced by the provided files
+- technologies must be a JSON array, never a string
+
+---
+
+EXAMPLE 1 — Python library
+
+Input: psf/requests, language: Python, stars: 52000
+Output:
+{
+  "summary": "Requests is a simple and elegant HTTP library for Python, designed to make HTTP/1.1 requests effortless for humans. It abstracts away urllib3 complexity and is one of the most downloaded Python packages, used across web scraping, API clients, and testing.",
+  "technologies": ["Python", "urllib3", "certifi", "charset-normalizer", "idna", "pytest"],
+  "structure": "Core library code lives in src/requests/ with modules for sessions, auth, adapters, and exceptions. Tests are in tests/, documentation source in docs/. Package metadata is in pyproject.toml and setup.cfg."
+}
+
+---
+
+EXAMPLE 2 — JavaScript framework
+
+Input: expressjs/express, language: JavaScript, stars: 64000
+Output:
+{
+  "summary": "Express is a minimal and unopinionated web framework for Node.js, providing a thin layer of HTTP utilities and middleware routing without obscuring Node.js features. It is the de-facto standard server framework for Node.js and forms the basis of many higher-level frameworks.",
+  "technologies": ["Node.js", "JavaScript", "npm", "mocha", "supertest"],
+  "structure": "The framework core is in lib/ with router/, middleware/, and application logic. Tests live in test/ mirroring the lib/ structure. package.json defines entry points and dependencies."
+}
+
+---
+
+EXAMPLE 3 — DevOps / multi-language tool
+
+Input: cli/cli, language: Go, stars: 38000
+Output:
+{
+  "summary": "The GitHub CLI (gh) brings GitHub functionality — pull requests, issues, Actions, and more — directly into the terminal. It supports scripting and automation workflows and is the official command-line tool maintained by GitHub.",
+  "technologies": ["Go", "cobra", "go-gh", "Makefile", "GitHub Actions"],
+  "structure": "Commands are defined under pkg/cmd/ with one sub-package per command group (pr, issue, repo, etc). Internal utilities are in internal/, API client in api/. Integration tests live in pkg/cmd alongside unit tests."
+}
+
+---
+
+Now analyse the repository provided and return your JSON response.
 """
 
 

@@ -150,6 +150,14 @@ Sending an entire repo to an LLM isn't practical — repos can have thousands of
 
 ## Error reference
 
+All errors return the same JSON shape:
+```json
+{
+"status": "error", 
+"message": "Description of what went wrong"
+}
+```
+
 | Scenario | HTTP status |
 |----------|-------------|
 | Invalid or non-GitHub URL | 422 |
